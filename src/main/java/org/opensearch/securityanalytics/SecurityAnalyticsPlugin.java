@@ -211,7 +211,8 @@ public class SecurityAnalyticsPlugin extends Plugin implements ActionPlugin, Map
                 new RestSearchCorrelationRuleAction(),
                 new RestIndexCustomLogTypeAction(),
                 new RestSearchCustomLogTypeAction(),
-                new RestDeleteCustomLogTypeAction()
+                new RestDeleteCustomLogTypeAction(),
+                new RestRunDetectorsAction()
         );
     }
 
@@ -313,6 +314,7 @@ public class SecurityAnalyticsPlugin extends Plugin implements ActionPlugin, Map
                 new ActionPlugin.ActionHandler<>(GetIndexMappingsAction.INSTANCE, TransportGetIndexMappingsAction.class),
                 new ActionPlugin.ActionHandler<>(IndexDetectorAction.INSTANCE, TransportIndexDetectorAction.class),
                 new ActionPlugin.ActionHandler<>(DeleteDetectorAction.INSTANCE, TransportDeleteDetectorAction.class),
+                new ActionPlugin.ActionHandler<>(RunDetectorsAction.INSTANCE, TransportRunDetectorsAction.class),
                 new ActionPlugin.ActionHandler<>(GetMappingsViewAction.INSTANCE, TransportGetMappingsViewAction.class),
                 new ActionPlugin.ActionHandler<>(GetDetectorAction.INSTANCE, TransportGetDetectorAction.class),
                 new ActionPlugin.ActionHandler<>(SearchDetectorAction.INSTANCE, TransportSearchDetectorAction.class),
