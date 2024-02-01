@@ -23,15 +23,28 @@ import org.opensearch.client.node.NodeClient;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.xcontent.LoggingDeprecationHandler;
+import org.opensearch.common.xcontent.XContentFactory;
+import org.opensearch.common.xcontent.XContentType;
+import org.opensearch.common.xcontent.support.XContentMapValues;
 import org.opensearch.commons.alerting.AlertingPluginInterface;
 import org.opensearch.commons.alerting.action.IdDocPair;
 import org.opensearch.commons.alerting.action.RunWorkflowRequest;
 import org.opensearch.commons.alerting.action.RunWorkflowResponse;
+import org.opensearch.commons.alerting.model.DocLevelMonitorInput;
+import org.opensearch.commons.alerting.model.DocLevelQuery;
+import org.opensearch.commons.alerting.model.Monitor;
+import org.opensearch.commons.alerting.model.ScheduledJob;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
+import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.IndexNotFoundException;
+import org.opensearch.index.mapper.MapperParsingException;
+import org.opensearch.index.query.IdsQueryBuilder;
+import org.opensearch.search.SearchHit;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.sort.FieldSortBuilder;
 import org.opensearch.securityanalytics.action.RunDetectorsAction;
@@ -44,11 +57,17 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -167,7 +186,10 @@ public class TransportRunDetectorsAction extends HandledTransportAction<BulkRequ
             public void onResponse(final SearchResponse searchResponse) {
                 try {
                     final List<Detector> searchHitDetectors = DetectorUtils.getDetectors(searchResponse, xContentRegistry);
-                    getWorkflowIdToDocs(indexToIdDocPairs, searchHitDetectors, bulkResponse, listener);
+                    final Map<String, String> monitorIdToWorkflowId = searchHitDetectors.stream()
+                            .map(detector -> Map.entry(detector.getMonitorIds().get(0), detector.getWorkflowIds().get(0)))
+                            .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+                    getWorkflowIdToFields(monitorIdToWorkflowId, indexToIdDocPairs, searchHitDetectors, bulkResponse, listener);
                 } catch (final IOException e) {
                     listener.onFailure(SecurityAnalyticsException.wrap(e));
                 }
@@ -185,7 +207,72 @@ public class TransportRunDetectorsAction extends HandledTransportAction<BulkRequ
         });
     }
 
-    private void getWorkflowIdToDocs(final Map<String, List<IdDocPair>> indexToIdDocPairs,
+    private void getWorkflowIdToFields(final Map<String, String> monitorIdToWorkflowId,
+                                       final Map<String, List<IdDocPair>> indexToIdDocPairs,
+                                       final List<Detector> detectors,
+                                       final BulkResponse bulkResponse,
+                                       final ActionListener<BulkResponse> listener) {
+        final Set<String> monitorIds = monitorIdToWorkflowId.keySet();
+        final IdsQueryBuilder idsQueryBuilder = new IdsQueryBuilder().addIds(monitorIds.toArray(String[]::new));
+        final SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder()
+                .query(idsQueryBuilder)
+                .size(10000);
+
+        final SearchRequest searchRequest = new SearchRequest()
+                .indices(ScheduledJob.SCHEDULED_JOBS_INDEX)
+                .source(searchSourceBuilder);
+
+        client.execute(SearchAction.INSTANCE, searchRequest, new ActionListener<>() {
+            @Override
+            public void onResponse(final SearchResponse searchResponse) {
+                try {
+                    final List<Monitor> monitors = parseMonitors(searchResponse);
+                    final Map<String, Set<String>> workflowIdToFieldNames = getWorkflowIdToFieldNames(monitorIdToWorkflowId, monitors);
+                    getWorkflowIdToDocs(workflowIdToFieldNames, indexToIdDocPairs, detectors, bulkResponse, listener);
+                } catch (final Exception e) {
+                    listener.onFailure(SecurityAnalyticsException.wrap(e));
+                }
+            }
+
+            @Override
+            public void onFailure(final Exception e) {
+                listener.onFailure(SecurityAnalyticsException.wrap(e));
+            }
+        });
+    }
+
+    private List<Monitor> parseMonitors(final SearchResponse searchResponse) throws IOException {
+        final List<Monitor> monitors = new LinkedList<>();
+        for (SearchHit hit : searchResponse.getHits().getHits()) {
+            final XContentParser xcp = XContentType.JSON.xContent().createParser(
+                    xContentRegistry,
+                    LoggingDeprecationHandler.INSTANCE, hit.getSourceAsString());
+            final Monitor monitor = (Monitor) ScheduledJob.Companion.parse(xcp, hit.getId(), hit.getVersion());
+            monitors.add(monitor);
+        }
+        return monitors;
+    }
+
+    private Map<String, Set<String>> getWorkflowIdToFieldNames(final Map<String, String> monitorIdToWorkflowId, final List<Monitor> monitors) {
+        final Map<String, Set<String>> workflowIdToFieldNames = new HashMap<>();
+        monitors.forEach(monitor -> {
+            final String monitorId = monitor.getId();
+            final String workflowId = monitorIdToWorkflowId.get(monitorId);
+            final DocLevelMonitorInput docLevelMonitorInput = (DocLevelMonitorInput) monitor.getInputs().get(0);
+            final Set<String> fieldNames = docLevelMonitorInput.getQueries().stream()
+                    .map(DocLevelQuery::getQueryFieldNames)
+                    .flatMap(Collection::stream)
+                    .collect(Collectors.toSet());
+
+            workflowIdToFieldNames.putIfAbsent(workflowId, new HashSet<>());
+            workflowIdToFieldNames.get(workflowId).addAll(fieldNames);
+        });
+
+        return workflowIdToFieldNames;
+    }
+
+    private void getWorkflowIdToDocs(final Map<String, Set<String>> workflowIdToFieldNames,
+                                     final Map<String, List<IdDocPair>> indexToIdDocPairs,
                                      final List<Detector> detectors,
                                      final BulkResponse bulkResponse,
                                      final ActionListener<BulkResponse> listener)  {
@@ -193,8 +280,11 @@ public class TransportRunDetectorsAction extends HandledTransportAction<BulkRequ
         indexToIdDocPairs.forEach((index, idDocPairs) -> {
             final List<String> workflowIds = getWorkflowIdsForIndex(index, detectors);
             workflowIds.forEach(workflowId -> {
+                final Set<String> fieldNames = workflowIdToFieldNames.get(workflowId);
+                final List<IdDocPair> filteredIdDocPairs = getFilteredIdDocPairs(idDocPairs, fieldNames);
+
                 workflowIdToDocs.putIfAbsent(workflowId, new ArrayList<>());
-                workflowIdToDocs.get(workflowId).addAll(idDocPairs);
+                workflowIdToDocs.get(workflowId).addAll(filteredIdDocPairs);
             });
         });
 
@@ -238,6 +328,7 @@ public class TransportRunDetectorsAction extends HandledTransportAction<BulkRequ
                 .collect(Collectors.toList());
     }
 
+
     // TODO - edge case on detector created for data stream/alias, but IndexRequest is directly to write index
     private boolean doesDetectorHaveIndexAsInput(final String index, final Detector detector) {
         final List<String> detectorInputs = detector.getInputs().stream()
@@ -246,5 +337,30 @@ public class TransportRunDetectorsAction extends HandledTransportAction<BulkRequ
                 .collect(Collectors.toList());
 
         return detectorInputs.contains(index);
+    }
+
+    private List<IdDocPair> getFilteredIdDocPairs(final List<IdDocPair> idDocPairs, final Set<String> fieldNames) {
+        return idDocPairs.stream()
+                .map(idDocPair -> {
+                    final String docId = idDocPair.getDocId();
+                    final BytesReference filteredDocument = getFilteredDocument(idDocPair.getDocument(), fieldNames);
+                    return new IdDocPair(docId, filteredDocument);
+                })
+                .collect(Collectors.toList());
+    }
+
+    private BytesReference getFilteredDocument(final BytesReference document, final Set<String> fieldNames) {
+        try {
+            final XContentParser xcp = XContentType.JSON.xContent().createParser(
+                    xContentRegistry, LoggingDeprecationHandler.INSTANCE, document.streamInput());
+            final Map<String, ?> documentAsMap = xcp.map();
+            final Map<String, Object> filteredDocumentAsMap = XContentMapValues.filter(documentAsMap, fieldNames.toArray(String[]::new), new String[0]);
+
+            final XContentBuilder builder = XContentFactory.jsonBuilder();
+            builder.map(filteredDocumentAsMap);
+            return BytesReference.bytes(builder);
+        } catch (final Exception e) {
+            throw new MapperParsingException("Exception parsing document to map", e);
+        }
     }
 }
