@@ -16,4 +16,16 @@ public abstract class Rule<T, U> {
         this.evaluationCondition = evaluationCondition;
         this.ruleCondition = ruleCondition;
     }
+
+    public String getId() {
+        return id;
+    }
+
+    public Predicate<T> getEvaluationCondition() {
+        return evaluationCondition;
+    }
+
+    public Predicate<U> getRuleCondition() {
+        return ruleCondition;
+    }
 }

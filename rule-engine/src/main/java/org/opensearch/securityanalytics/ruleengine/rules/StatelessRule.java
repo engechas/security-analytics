@@ -16,4 +16,8 @@ public class StatelessRule extends Rule<DataType, DataType> {
         super(id, evaluationCondition, ruleCondition);
         this.isStatefulCondition = isStatefulCondition;
     }
+
+    public boolean isStatefulCondition() {
+        return isStatefulCondition;
+    }
 }
